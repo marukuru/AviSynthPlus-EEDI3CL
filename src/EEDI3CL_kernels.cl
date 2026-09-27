@@ -316,7 +316,7 @@ static const char* interpolation_kernels_source =
 "    float a0 = mdiff0 * rcpVthresh0;                                                                                                                                                                \n"
 "    float a1 = mdiff1 * rcpVthresh1;                                                                                                                                                                \n"
 "    float a2 = fmax((vthresh2 - abs(dirc)) * rcpVthresh2, 0.0f);                                                                                                                                    \n"
-"    float a = clamp(fmax(fmax(a0, a1), a2), min_value, max_value);                                                                                                                                  \n"
+"    float a = clamp(fmax(fmax(a0, a1), a2), 0.0f, 1.0f);                                                                                                                                  \n"
 "                                                                                                                                                                                                    \n"
 "    float final_pixel = mix(dstp_c, cint, a);                                                                                                                                                       \n"
 "    write_imagef(dst_out, (int2)(x, y), clamp(final_pixel, min_value, max_value));                                                                                                                  \n"

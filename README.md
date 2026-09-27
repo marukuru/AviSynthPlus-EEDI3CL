@@ -1,3 +1,6 @@
+> [!NOTE]
+> **AI-assisted development: CODEX GPT-6 Astra Extra High**
+
 ## Description
 
 EEDI3 works by finding the best non-decreasing (non-crossing) warping between two lines by minimizing a cost functional. The cost is based on neighborhood similarity (favor connecting regions that look similar), the vertical difference created by the interpolated values (favor small differences), the interpolation directions (favor short connections vs long), and the change in interpolation direction from pixel to pixel (favor small changes).
@@ -157,16 +160,19 @@ EEDI3CL(clip input, int "field", bool "dh", int[] "planes", float "alpha", float
 
 #### Prerequisites
 - **Git**
-- **CMake** >= 3.25
+- **CMake** >= 3.22
 - A **C++20 capable compiler** (e.g., Visual Studio 2022, GCC 11+, Clang 12+)
-- **Boost** libraries > 1.89 (chrono, filesystem). Must be findable by CMake.
+- **Boost** >= 1.74 (headers, filesystem, system). The headers and libraries must come from the same Boost version and be findable by CMake.
 - An **OpenCL SDK**. Must be findable by CMake.
+- **Recent AviSynth+ development headers** (`avisynth.h`, `avisynth_c.h` and the `avs/` directory), compatible with the bundled `avs_c_api_loader`. Older headers such as those from AviSynth+ 3.7.3 lack C API declarations needed to compile the loader, even though older runtimes are supported.
 
 1.  (Linux) Install prerequisites (example for Debian/Ubuntu):
 
     ```
-    sudo apt-get install build-essential git cmake libboost-chrono-dev libboost-filesystem-dev libboost-system-dev ocl-icd-opencl-dev
+    sudo apt-get install build-essential git cmake libboost-dev libboost-filesystem-dev libboost-system-dev ocl-icd-opencl-dev
     ```
+
+    Ubuntu 22.04 provides CMake 3.22, GCC 11 and Boost 1.74, which are sufficient. Install the AviSynth+ development headers separately if they are not already present.
 
 2.  Clone the repository:
 
@@ -175,10 +181,20 @@ EEDI3CL(clip input, int "field", bool "dh", int[] "planes", float "alpha", float
     cd AviSynthPlus-EEDI3CL
     ```
 
+    For an existing checkout, initialize the helper submodule with `git submodule update --init --recursive`.
+
 3.  Configure and build the project:
 
     ```
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j$(nproc)
+    ```
+
+    If your installed AviSynth+ headers are too old, obtain a recent [AviSynth+ source checkout](https://github.com/AviSynth/AviSynthPlus) and pass its include directory explicitly:
+
+    ```
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+        -DAvisynthPlus_INCLUDE_DIR=/path/to/AviSynthPlus/avs_core/include
     cmake --build build -j$(nproc)
     ```
 
@@ -187,3 +203,37 @@ EEDI3CL(clip input, int "field", bool "dh", int[] "planes", float "alpha", float
     ```
     sudo cmake --install build
     ```
+
+#### Boost version conflicts
+
+The project does not require Boost 1.81 specifically. CMake selects an installed
+`BoostConfig.cmake`, and that configuration requires matching versions of its
+component libraries. For example, a Boost 1.81 configuration cannot use a
+Boost 1.80 component package.
+
+Use one consistent Boost installation. Boost.Chrono and Boost.Thread binaries
+are not needed: the plugin uses C++ `thread_local` storage, and Boost.Compute's
+offline cache needs only Boost.Filesystem and Boost.System.
+
+After changing Boost installations, configure in a new build directory to avoid
+cached paths. If several versions are installed, select the intended one with
+`Boost_DIR`, for example with Ubuntu 22.04's Boost 1.74 packages on x86-64:
+
+```
+cmake -S . -B build-ubuntu -DCMAKE_BUILD_TYPE=Release \
+    -DBoost_DIR=/usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0
+cmake --build build-ubuntu -j$(nproc)
+```
+
+#### Regression tests
+
+CMake enables a load-only CTest check on Unix when Python is available. It
+resolves all symbols immediately, catching missing template instantiations
+without requiring an OpenCL device.
+
+For rendered-frame tests, set `EEDI3CL_AVS_RUNNER` to the QTGMC project's
+`avs_runner` executable when configuring. This also enables an independent
+OpenCL vCheck test. Run `ctest --test-dir build --output-on-failure`.
+See [AUDIT.md](AUDIT.md) for the local 1.1.2 fixes, validation commands, and
+instrumentation limits. `dh=true` requires explicit `field=0` or `field=1`;
+`dw=true` also rejects the automatic double-rate mode `field=-2`.

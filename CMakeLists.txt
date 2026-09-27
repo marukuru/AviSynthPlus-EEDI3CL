@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.22)
 
 if (NOT CMAKE_GENERATOR MATCHES "Visual Studio")
     if (NOT CMAKE_BUILD_TYPE)
@@ -12,7 +12,9 @@ option(USE_SYSTEM_AVS_HELPER "Use an installed version of avs_c_api_loader" OFF)
 
 find_package(OpenCL REQUIRED)
 
-find_package(Boost REQUIRED COMPONENTS chrono filesystem thread)
+# Boost.Compute uses C++ thread_local storage; its offline cache only needs
+# Boost.Filesystem and Boost.System, not the Chrono or Thread libraries.
+find_package(Boost 1.74 REQUIRED COMPONENTS filesystem system)
 
 if(USE_SYSTEM_AVS_HELPER)
     message(STATUS "Using system-provided avs_c_api_loader")
@@ -46,11 +48,16 @@ target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 target_link_libraries(${PROJECT_NAME} PRIVATE
     avs_c_api_loader::avs_c_api_loader
     Boost::headers
-    Boost::chrono
     Boost::filesystem
-    Boost::thread
+    Boost::system
     OpenCL::OpenCL
 )
+
+# The plugin resolves AviSynth through avs_c_api_loader, so unresolved symbols
+# on Linux indicate a build error rather than symbols supplied by the host.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--no-undefined")
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
     target_link_libraries(${PROJECT_NAME} PRIVATE "libmmds")
@@ -61,9 +68,9 @@ set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/EEDI3CL_AVX512.cpp"
 
 if (NOT CMAKE_GENERATOR MATCHES "Visual Studio")
     string(TOLOWER ${CMAKE_BUILD_TYPE} build_type)
-    if (build_type STREQUAL Debug)
+    if (build_type STREQUAL "debug")
         target_compile_definitions(${PROJECT_NAME} PRIVATE DEBUG_BUILD)
-    else (build_type STREQUAL Release)
+    else()
         target_compile_definitions(${PROJECT_NAME} PRIVATE RELEASE_BUILD)
     endif()
 
@@ -170,5 +177,27 @@ if(UNIX)
 
     add_custom_target(uninstall
         COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake")
+    endif()
+endif()
+
+# Load-only regression needs no GPU or AviSynth runtime. The optional render
+# suite explicitly requires both and uses QTGMC's standalone AviSynth runner.
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND AND UNIX)
+        add_test(NAME load_library COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/load_library.py" "$<TARGET_FILE:EEDI3CL>")
+        set(EEDI3CL_AVS_RUNNER "" CACHE FILEPATH "AviSynth+ avs_runner for OpenCL regression tests")
+        if(EEDI3CL_AVS_RUNNER)
+            add_executable(vcheck_test tests/vcheck_test.cpp)
+            target_compile_features(vcheck_test PRIVATE cxx_std_17)
+            target_link_libraries(vcheck_test PRIVATE Boost::headers OpenCL::OpenCL)
+            add_test(NAME vcheck_weights COMMAND vcheck_test)
+            add_test(NAME render_regression COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/regression.py"
+                --runner "${EEDI3CL_AVS_RUNNER}" --plugin "$<TARGET_FILE:EEDI3CL>"
+                --work "${CMAKE_CURRENT_BINARY_DIR}/regression")
+        endif()
     endif()
 endif()

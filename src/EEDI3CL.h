@@ -103,7 +103,7 @@ struct EEDI3CLData
     std::unique_ptr<int[]> dmap;
 
     void (*filter)(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n, bool use_dh,
-        EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+        EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);
 };
 
 template<typename T>
@@ -114,10 +114,10 @@ void copyPad(const AVS_VideoFrame* src, AVS_VideoFrame* dst, const int plane, co
 
 template<typename T>
 void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n, bool use_dh,
-    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);
 template<typename T>
 void filterCL_avx2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n, bool use_dh,
-    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);
 template<typename T>
 void filterCL_avx512(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n, bool use_dh,
-    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);

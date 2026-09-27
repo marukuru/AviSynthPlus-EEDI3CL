@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <locale>
+#include <cmath>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -69,28 +70,40 @@ void copyPad(const AVS_VideoFrame* src, AVS_VideoFrame* dst, const int plane, co
 
     dstp += dstStride * (4 + off);
 
+    // Mirror image coordinates, including planes smaller than the
+    // padding radius. Reading another padding sample before it is initialized
+    // makes narrow chroma planes nondeterministic.
+    const auto reflect = [](int coordinate, int length) noexcept {
+        if (length <= 1) return 0;
+        const int period = 2 * (length - 1);
+        coordinate %= period;
+        if (coordinate < 0) coordinate += period;
+        return coordinate < length ? coordinate : period - coordinate;
+    };
     for (int y{4 + off}; y < dstHeight - 4; y += 2)
     {
         for (int x{0}; x < 12; ++x)
-            dstp[x] = dstp[24 - x];
-
-        for (int x{dstWidth - 12}, c{2}; x < dstWidth; ++x, c += 2)
-            dstp[x] = dstp[x - c];
-
+            dstp[x] = dstp[12 + reflect(x - 12, srcWidth)];
+        for (int x{dstWidth - 12}; x < dstWidth; ++x)
+            dstp[x] = dstp[12 + reflect(x - 12, srcWidth)];
         dstp += dstStride * 2;
     }
-
     dstp = reinterpret_cast<T*>(g_avs_api->avs_get_write_ptr_p(dst, plane0));
-
-    for (int y{off}; y < 4; y += 2)
-        memcpy(dstp + dstStride * y, dstp + dstStride * (8 - y), dstWidth * sizeof(T));
-
-    for (int y{dstHeight - 4 + off}, c{2 + 2 * off}; y < dstHeight; y += 2, c += 4)
-        memcpy(dstp + dstStride * y, dstp + dstStride * (y - c), dstWidth * sizeof(T));
+    for (int y{off}; y < dstHeight; y += 2)
+    {
+        if (y >= 4 + off && y < dstHeight - 4) continue;
+        const int sourceY = 4 + reflect(y - 4, dstHeight - 8);
+        memcpy(dstp + dstStride * y, dstp + dstStride * sourceY, dstWidth * sizeof(T));
+    }
 }
 
+// The SIMD translation units call these specializations without seeing the template definition.
+template void copyPad<uint8_t>(const AVS_VideoFrame*, AVS_VideoFrame*, int, int, int, bool, AVS_ScriptEnvironment*) noexcept;
+template void copyPad<uint16_t>(const AVS_VideoFrame*, AVS_VideoFrame*, int, int, int, bool, AVS_ScriptEnvironment*) noexcept;
+template void copyPad<float>(const AVS_VideoFrame*, AVS_VideoFrame*, int, int, int, bool, AVS_ScriptEnvironment*) noexcept;
+
 static void filterCL_c(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n, bool use_dh,
-    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi)
+    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override)
 {
     constexpr int planes_y[4]{AVS_PLANAR_Y, AVS_PLANAR_U, AVS_PLANAR_V, AVS_PLANAR_A};
     constexpr int planes_r[4]{AVS_PLANAR_R, AVS_PLANAR_G, AVS_PLANAR_B, AVS_PLANAR_A};
@@ -100,9 +113,9 @@ static void filterCL_c(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS
 
     for (int plane{0}; plane < g_avs_api->avs_num_components(&fi->vi); ++plane)
     {
-        if (d->process[plane])
+        if (d->process[plane] && (plane_override < 0 || plane == plane_override))
         {
-            const int current_plane{planes[plane]};
+            const int current_plane{plane_override < 0 ? planes[plane] : AVS_DEFAULT_PLANE};
 
             AVS_VideoInfo vi_pad;
             memcpy(&vi_pad, &fi->vi, sizeof(AVS_VideoInfo));
@@ -113,6 +126,7 @@ static void filterCL_c(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS
             vi_pad.height = src_h_for_pad + 8;
             avs_helpers::avs_video_frame_ptr pad(g_avs_api->avs_new_video_frame_a(fi->env, &vi_pad, AVS_FRAME_ALIGN));
             AVS_VideoFrame* pad_raw{pad.get()};
+            if (!pad_raw) throw std::runtime_error("padding frame allocation failed");
 
             int peak{d->peak};
 
@@ -151,7 +165,7 @@ static void filterCL_c(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS
 
             const size_t globalWorkSize[]{static_cast<size_t>((dstWidth + 63) & -64), 1};
             constexpr size_t localWorkSize[]{64, 1};
-            const int bufferSize{static_cast<int>(dstWidth * d->tpitch * sizeof(cl_float))};
+            const size_t bufferSize{static_cast<size_t>(dstWidth) * d->tpitch * sizeof(cl_float)};
 
             queue.enqueue_write_image(srcImage, boost::compute::dim(0, 0), boost::compute::dim(paddedWidth, paddedHeight),
                 g_avs_api->avs_get_read_ptr_p(pad_raw, AVS_DEFAULT_PLANE), g_avs_api->avs_get_pitch_p(pad_raw, AVS_DEFAULT_PLANE));
@@ -277,63 +291,49 @@ AVS_FORCEINLINE void muldivRational(unsigned* __restrict num, unsigned* __restri
     *den /= static_cast<unsigned>(a);
 }
 
-static void transpose_video_frame_cl(
-    AVS_VideoFrame* dst, const AVS_VideoFrame* src, EEDI3CLData* __restrict d, const AVS_VideoInfo* __restrict vi)
+static void transpose_plane_cl(AVS_VideoFrame* dst, int dst_plane,
+    const AVS_VideoFrame* src, int src_plane, int comp_size, EEDI3CLData* d)
 {
-    const int planes_y[4]{AVS_PLANAR_Y, AVS_PLANAR_U, AVS_PLANAR_V, AVS_PLANAR_A};
-    const int planes_r[4]{AVS_PLANAR_R, AVS_PLANAR_G, AVS_PLANAR_B, AVS_PLANAR_A};
-    const int* planes{(avs_is_rgb(vi) ? planes_r : planes_y)};
     auto& queue = d->queue;
+    const int src_w{g_avs_api->avs_get_row_size_p(src, src_plane) / comp_size};
+    const int src_h{g_avs_api->avs_get_height_p(src, src_plane)};
+    const int src_pitch{g_avs_api->avs_get_pitch_p(src, src_plane)};
+    const int dst_pitch{g_avs_api->avs_get_pitch_p(dst, dst_plane)};
+    const void* srcp{g_avs_api->avs_get_read_ptr_p(src, src_plane)};
+    void* dstp{g_avs_api->avs_get_write_ptr_p(dst, dst_plane)};
 
-    for (int i{0}; i < g_avs_api->avs_num_components(vi); ++i)
+    const size_t src_buffer_size{static_cast<size_t>(src_pitch) * src_h};
+    const size_t dst_buffer_size{static_cast<size_t>(dst_pitch) * src_w};
+
+    boost::compute::buffer src_buf(
+        queue.get_context(), src_buffer_size, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, const_cast<void*>(srcp));
+    boost::compute::buffer dst_buf(queue.get_context(), dst_buffer_size, CL_MEM_WRITE_ONLY);
+
+    constexpr size_t TILE_DIM{16};
+    const size_t global_work_size[2] = {(static_cast<size_t>(src_w) + TILE_DIM - 1) / TILE_DIM * TILE_DIM,
+        (static_cast<size_t>(src_h) + TILE_DIM - 1) / TILE_DIM * TILE_DIM};
+    const size_t local_work_size[2] = {TILE_DIM, TILE_DIM};
+
+    auto run_kernel{[&](auto& kernel) {
+        kernel.set_args(
+            src_buf, dst_buf, src_w, src_h, static_cast<int>(src_pitch / comp_size), static_cast<int>(dst_pitch / comp_size));
+        queue.enqueue_nd_range_kernel(kernel, 2, nullptr, global_work_size, local_work_size);
+    }};
+
+    switch (comp_size)
     {
-        if (d->process[i])
-        {
-            const int plane{planes[i]};
-
-            const int comp_size{g_avs_api->avs_component_size(vi)};
-            const int src_w{g_avs_api->avs_get_row_size_p(src, plane) / comp_size};
-            const int src_h{g_avs_api->avs_get_height_p(src, plane)};
-            const int src_pitch{g_avs_api->avs_get_pitch_p(src, plane)};
-            const int dst_pitch{g_avs_api->avs_get_pitch_p(dst, plane)};
-            const void* srcp{g_avs_api->avs_get_read_ptr_p(src, plane)};
-            void* dstp{g_avs_api->avs_get_write_ptr_p(dst, plane)};
-
-            const size_t src_buffer_size{static_cast<size_t>(src_pitch) * src_h};
-            const size_t dst_buffer_size{static_cast<size_t>(dst_pitch) * src_w};
-
-            boost::compute::buffer src_buf(
-                queue.get_context(), src_buffer_size, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, const_cast<void*>(srcp));
-            boost::compute::buffer dst_buf(queue.get_context(), dst_buffer_size, CL_MEM_WRITE_ONLY);
-
-            constexpr size_t TILE_DIM{16};
-            const size_t global_work_size[2] = {(static_cast<size_t>(src_w) + TILE_DIM - 1) / TILE_DIM * TILE_DIM,
-                (static_cast<size_t>(src_h) + TILE_DIM - 1) / TILE_DIM * TILE_DIM};
-            const size_t local_work_size[2] = {TILE_DIM, TILE_DIM};
-
-            auto run_kernel{[&](auto& kernel) {
-                kernel.set_args(
-                    src_buf, dst_buf, src_w, src_h, static_cast<int>(src_pitch / comp_size), static_cast<int>(dst_pitch / comp_size));
-                queue.enqueue_nd_range_kernel(kernel, 2, nullptr, global_work_size, local_work_size);
-            }};
-
-            switch (comp_size)
-            {
-            case 1:
-                run_kernel(d->transpose_u8_kernel);
-                break;
-            case 2:
-                run_kernel(d->transpose_u16_kernel);
-                break;
-            default:
-                run_kernel(d->transpose_f32_kernel);
-                break;
-            }
-
-            queue.enqueue_read_buffer(dst_buf, 0, dst_buffer_size, dstp);
-        }
+    case 1:
+        run_kernel(d->transpose_u8_kernel);
+        break;
+    case 2:
+        run_kernel(d->transpose_u16_kernel);
+        break;
+    default:
+        run_kernel(d->transpose_f32_kernel);
+        break;
     }
 
+    queue.enqueue_read_buffer(dst_buf, 0, dst_buffer_size, dstp);
     queue.finish();
 }
 
@@ -362,6 +362,7 @@ static AVS_VideoFrame* AVSC_CC get_frame_EEDI3CL(AVS_FilterInfo* __restrict fi, 
 
     avs_helpers::avs_video_frame_ptr dst{g_avs_api->avs_new_video_frame_p(fi->env, &fi->vi, src_raw)};
     AVS_VideoFrame* dst_raw{dst.get()};
+    if (!dst_raw) { fi->error = "EEDI3CL: output frame allocation failed"; return nullptr; }
     avs_helpers::avs_video_frame_ptr scp;
 
     if (d->vcheck && d->sclip)
@@ -372,45 +373,21 @@ static AVS_VideoFrame* AVSC_CC get_frame_EEDI3CL(AVS_FilterInfo* __restrict fi, 
     if (d->field < 0)
     {
         int err;
-        const int64_t field_based{
-            g_avs_api->avs_prop_get_int(fi->env, g_avs_api->avs_get_frame_props_ro(fi->env, src_raw), "_FieldBased", 0, &err)};
-        if (err == 0)
-        {
-            if (field_based == 1)
-                field = 0;
-            else if (field_based == 2)
-                field = 1;
-
-            if (d->field > 1 || field_no_prop > 1)
-            {
-                if (field_based == 0)
-                    field -= 2;
-
-                field = static_cast<int>((n & 1) ? (field == 0) : (field == 1));
-            }
-        }
-        else
-        {
-            if (field > 1)
-            {
-                field -= 2;
-                field = static_cast<int>((n & 1) ? (field == 0) : (field == 1));
-            }
-        }
+        const int64_t field_based = g_avs_api->avs_prop_get_int(fi->env,
+            g_avs_api->avs_get_frame_props_ro(fi->env, src_raw), "_FieldBased", 0, &err);
+        if (!err && (field_based == 1 || field_based == 2))
+            field = static_cast<int>(field_based - 1) + (field_no_prop > 1 ? 2 : 0);
     }
-    else
+    if (field > 1)
     {
-        if (field > 1)
-        {
-            field -= 2;
-            field = static_cast<int>((n & 1) ? (field == 0) : (field == 1));
-        }
+        const int order = field - 2;
+        field = (n & 1) ? 1 - order : order;
     }
 
     try
     {
         if (!d->dw)
-            d->filter(src_raw, scp_raw, dst_raw, field, d->dh, d, fi);
+            d->filter(src_raw, scp_raw, dst_raw, field, d->dh, d, fi, -1);
         else
         {
             AVS_VideoInfo vi_inter{fi->vi};
@@ -418,21 +395,33 @@ static AVS_VideoFrame* AVSC_CC get_frame_EEDI3CL(AVS_FilterInfo* __restrict fi, 
             vi_inter.height = (d->dh) ? (src_vi->height << 1) : src_vi->height;
             avs_helpers::avs_video_frame_ptr inter{g_avs_api->avs_new_video_frame_a(fi->env, &vi_inter, AVS_FRAME_ALIGN)};
             AVS_VideoFrame* inter_raw{inter.get()};
-            d->filter(src_raw, nullptr, inter_raw, field, d->dh, d, fi);
+            if (!inter_raw) throw std::runtime_error("intermediate frame allocation failed");
+            d->filter(src_raw, nullptr, inter_raw, field, d->dh, d, fi, -1);
 
-            AVS_VideoInfo vi_t_src{vi_inter};
-            std::swap(vi_t_src.width, vi_t_src.height);
-            avs_helpers::avs_video_frame_ptr src_t{g_avs_api->avs_new_video_frame_a(fi->env, &vi_t_src, AVS_FRAME_ALIGN)};
-            AVS_VideoFrame* src_t_raw{src_t.get()};
-
-            AVS_VideoInfo vi_t_dst{vi_t_src};
-            vi_t_dst.height <<= 1;
-            avs_helpers::avs_video_frame_ptr dst_t{g_avs_api->avs_new_video_frame_a(fi->env, &vi_t_dst, AVS_FRAME_ALIGN)};
-            AVS_VideoFrame* dst_t_raw{dst_t.get()};
-
-            transpose_video_frame_cl(src_t_raw, inter_raw, d, src_vi);
-            d->filter(src_t_raw, nullptr, dst_t_raw, 0, true, d, fi);
-            transpose_video_frame_cl(dst_raw, dst_t_raw, d, src_vi);
+            // Use a gray temporary for each transposed plane. This represents
+            // the rotated 422 chroma grid correctly, including on runtimes
+            // predating native 440 pixel formats.
+            constexpr int yuv_planes[]{AVS_PLANAR_Y, AVS_PLANAR_U, AVS_PLANAR_V, AVS_PLANAR_A};
+            constexpr int rgb_planes[]{AVS_PLANAR_R, AVS_PLANAR_G, AVS_PLANAR_B, AVS_PLANAR_A};
+            const int* planes = avs_is_rgb(&fi->vi) ? rgb_planes : yuv_planes;
+            const int comp_size = g_avs_api->avs_component_size(&fi->vi);
+            for (int p = 0; p < g_avs_api->avs_num_components(&fi->vi); ++p)
+            {
+                if (!d->process[p]) continue;
+                const int plane = planes[p];
+                AVS_VideoInfo vi_t_src{vi_inter};
+                vi_t_src.pixel_type = AVS_CS_GENERIC_Y | (fi->vi.pixel_type & AVS_CS_SAMPLE_BITS_MASK);
+                vi_t_src.width = g_avs_api->avs_get_height_p(inter_raw, plane);
+                vi_t_src.height = g_avs_api->avs_get_row_size_p(inter_raw, plane) / comp_size;
+                avs_helpers::avs_video_frame_ptr src_t{g_avs_api->avs_new_video_frame_a(fi->env, &vi_t_src, AVS_FRAME_ALIGN)};
+                AVS_VideoInfo vi_t_dst{vi_t_src};
+                vi_t_dst.height *= 2;
+                avs_helpers::avs_video_frame_ptr dst_t{g_avs_api->avs_new_video_frame_a(fi->env, &vi_t_dst, AVS_FRAME_ALIGN)};
+                if (!src_t || !dst_t) throw std::runtime_error("transpose frame allocation failed");
+                transpose_plane_cl(src_t.get(), AVS_DEFAULT_PLANE, inter_raw, plane, comp_size, d);
+                d->filter(src_t.get(), nullptr, dst_t.get(), 0, true, d, fi, p);
+                transpose_plane_cl(dst_raw, plane, dst_t.get(), AVS_DEFAULT_PLANE, comp_size, d);
+            }
         }
     }
     catch (const boost::compute::opencl_error& error)
@@ -440,6 +429,13 @@ static AVS_VideoFrame* AVSC_CC get_frame_EEDI3CL(AVS_FilterInfo* __restrict fi, 
         std::string msg{"EEDI3CL: " + error.error_string()};
         fi->error = g_avs_api->avs_save_string(fi->env, msg.c_str(), static_cast<int>(msg.size()));
 
+        return nullptr;
+    }
+
+    catch (const std::exception& error)
+    {
+        const std::string msg = std::string("EEDI3CL: ") + error.what();
+        fi->error = g_avs_api->avs_save_string(fi->env, msg.c_str(), static_cast<int>(msg.size()));
         return nullptr;
     }
 
@@ -540,29 +536,15 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
         const int num_planes{num_planes_load.size};
         const int onlyY{(avs_defined(avs_array_elt(args, Luma))) ? avs_as_bool(avs_array_elt(args, Luma)) : 0};
 
-        if (onlyY)
-        {
-            d->process[0] = true;
-
-            for (int i{1}; i < 4; ++i)
-                d->process[i] = false;
-        }
-        else
-        {
-            for (int i{0}; i < 4; ++i)
-                d->process[i] = (num_planes <= 0);
-        }
-
+        for (int i{0}; i < 4; ++i)
+            d->process[i] = num_planes <= 0 && (!onlyY || i == 0);
         for (int i{0}; i < num_planes; ++i)
         {
             const int n{num_planes_load.data[i]};
-
-            if (n >= g_avs_api->avs_num_components(&fi->vi))
+            if (n < 0 || n >= g_avs_api->avs_num_components(&fi->vi))
                 throw std::string{"plane index out of range"};
-
             if (d->process[n])
                 throw std::string{"plane specified twice"};
-
             d->process[n] = true;
         }
 
@@ -620,28 +602,36 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
         if (d->field < -2 || d->field > 3)
             throw std::string{"field must be -2, -1, 0, 1, 2, or 3"};
 
-        if (!d->dh && (fi->vi.height & 1))
-            throw std::string{"height must be mod 2 when dh=False"};
+        if (fi->vi.width <= 0 || fi->vi.height <= 0)
+            throw std::string{"input must contain video"};
+        const AVS_VideoInfo* input_vi = g_avs_api->avs_get_video_info(fi->child);
+        for (int plane = 0; plane < g_avs_api->avs_num_components(&fi->vi); ++plane)
+        {
+            const int sub = (plane == 1 || plane == 2) && !avs_is_rgb(input_vi)
+                ? g_avs_api->avs_get_plane_height_subsampling(input_vi, AVS_PLANAR_U) : 0;
+            if (!d->dh && d->process[plane] && ((input_vi->height >> sub) & 1))
+                throw std::string{"processed plane height must be mod 2 when dh=false"};
+        }
 
-        if (d->dh && d->field > 1)
+        if (d->dh && (d->field < 0 || d->field > 1))
             throw std::string{"field must be 0 or 1 when dh=True"};
 
-        if (d->dw && d->field > 1)
-            throw std::string{"dw=true is not supported with field=2 or 3"};
+        if (d->dw && (d->field == -2 || d->field > 1))
+            throw std::string{"dw=true is not supported with double-rate field=-2, 2 or 3"};
 
         if (d->dw && sclip_raw)
             throw std::string{"sclip is not supported when dw=true"};
 
-        if (alpha < 0.0f || alpha > 1.0f)
+        if (!std::isfinite(alpha) || alpha < 0.0f || alpha > 1.0f)
             throw std::string{"alpha must be between 0.0 and 1.0 (inclusive)"};
 
-        if (beta < 0.0f || beta > 1.0f)
+        if (!std::isfinite(beta) || beta < 0.0f || beta > 1.0f)
             throw std::string{"beta must be between 0.0 and 1.0 (inclusive)"};
 
         if (alpha + beta > 1.0f)
             throw std::string{"alpha+beta must be between 0.0 and 1.0 (inclusive)"};
 
-        if (d->gamma < 0.0f)
+        if (!std::isfinite(d->gamma) || d->gamma < 0.0f)
             throw std::string{"gamma must be greater than or equal to 0.0"};
 
         if (nrad < 0 || nrad > 3)
@@ -653,17 +643,23 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
         if (d->vcheck < 0 || d->vcheck > 3)
             throw std::string{"vcheck must be 0, 1, 2, or 3"};
 
-        if (d->vcheck && (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f))
+        if (!std::isfinite(vthresh0) || !std::isfinite(vthresh1) || !std::isfinite(d->vthresh2) ||
+            (d->vcheck && (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f)))
             throw std::string{"vthresh0, vthresh1, and vthresh2 must be greater than 0.0"};
 
         if (opt < -1 || opt > 3)
             throw std::string{"opt must be betwen -1 and 3 (inclusive)"};
 
-        const int cpu_instrucs{!(!!(g_avs_api->avs_get_cpu_flags(fi->env) & AVS_CPUF_AVX512F) && (opt < 0 || opt == 3))
-                                   ? !(!!(g_avs_api->avs_get_cpu_flags(fi->env) & AVS_CPUF_AVX2) && (opt < 0 || opt == 2))
-                                         ? !(!!(g_avs_api->avs_get_cpu_flags(fi->env) & AVS_CPU_SSE2) && (opt < 0 || opt == 1)) ? 0 : 1
-                                         : 2
-                                   : 3};
+        // Each ISA translation unit must be gated by every enabled feature.
+        const int flags = g_avs_api->avs_get_cpu_flags(fi->env);
+        constexpr int avx2Flags = AVS_CPUF_AVX2 | AVS_CPUF_FMA3;
+        constexpr int avx512Flags = avx2Flags | AVS_CPUF_AVX512F | AVS_CPUF_AVX512DQ |
+            AVS_CPUF_AVX512BW | AVS_CPUF_AVX512VL | AVS_CPUF_AVX512CD;
+        const bool avx512 = (flags & avx512Flags) == avx512Flags;
+        const bool avx2 = (flags & avx2Flags) == avx2Flags;
+        const int cpu_instrucs = avx512 && (opt < 0 || opt == 3) ? 3 :
+            avx2 && (opt < 0 || opt == 2) ? 2 :
+            (flags & AVS_CPU_SSE2) && (opt < 0 || opt == 1) ? 1 : 0;
 
         if (opt == 3 && cpu_instrucs != 3)
             throw std::string{"opt=3 requires AVX-512"};
@@ -672,7 +668,7 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
         else if (opt == 1 && cpu_instrucs != 1)
             throw std::string{"opt=1 requires SSE2"};
 
-        if (device_id >= static_cast<int>(boost::compute::system::device_count()))
+        if (device_id < -1 || device_id >= static_cast<int>(boost::compute::system::device_count()))
             throw std::string{"device index out of range"};
 
         if (avs_defined(avs_array_elt(args, List_device)) ? avs_as_bool(avs_array_elt(args, List_device)) : 0)
@@ -789,7 +785,11 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
         }
 
         if (d->dh)
-            fi->vi.height <<= 1;
+        {
+            if (fi->vi.height > (INT_MAX - 8) / 2)
+                throw std::string{"resulting clip is too tall"};
+            fi->vi.height *= 2;
+        }
 
         const float remainingWeight{1.0f - alpha - beta};
 
@@ -808,7 +808,7 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
                 throw std::string{"sclip's dimension doesn't match"};
         }
 
-        const AVS_VideoInfo* child_vi{g_avs_api->avs_get_video_info(clip_raw)};
+        const AVS_VideoInfo* child_vi{g_avs_api->avs_get_video_info(fi->child)};
         int max_processing_width{child_vi->width};
         int max_processing_height{(d->dh) ? (child_vi->height << 1) : child_vi->height};
 
@@ -820,7 +820,10 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
             max_processing_height = std::max(max_processing_height, pass2_h);
         }
 
-        const int dmap_elements{max_processing_width * max_processing_height};
+        if (max_processing_width > (INT_MAX / 4 - 24) || max_processing_height > INT_MAX - 8 ||
+            static_cast<size_t>(max_processing_width) * max_processing_height > INT_MAX)
+            throw std::string{"processing dimensions are too large"};
+        const size_t dmap_elements{static_cast<size_t>(max_processing_width) * max_processing_height};
         const int comp_size{g_avs_api->avs_component_size(&fi->vi)};
         int local_work_size{64};
 
@@ -1010,18 +1013,24 @@ static AVS_Value AVSC_CC Create_EEDI3CL(AVS_ScriptEnvironment* __restrict env, A
     }
     catch (const std::string& error)
     {
-        std::string msg{std::format("EEDI3CL: {}", error)};
+        const std::string msg{std::string{"EEDI3CL: "} + error};
         v = avs_new_value_error(g_avs_api->avs_save_string(fi->env, msg.c_str(), static_cast<int>(msg.size())));
     }
     catch (const boost::compute::no_device_found& error)
     {
-        std::string msg{std::format("EEDI3CL: {}", error.what())};
+        const std::string msg{std::string{"EEDI3CL: "} + error.what()};
         v = avs_new_value_error(g_avs_api->avs_save_string(fi->env, msg.c_str(), static_cast<int>(msg.size())));
     }
     catch (const boost::compute::opencl_error& error)
     {
-        std::string msg{std::format("EEDI3CL: {}", error.error_string())};
+        const std::string msg{std::string{"EEDI3CL: "} + error.error_string()};
         v = avs_new_value_error(g_avs_api->avs_save_string(fi->env, msg.c_str(), static_cast<int>(msg.size())));
+    }
+
+    catch (const std::exception& error)
+    {
+        const std::string msg{std::string{"EEDI3CL: "} + error.what()};
+        v = avs_new_value_error(g_avs_api->avs_save_string(env, msg.c_str(), static_cast<int>(msg.size())));
     }
 
     if (!avs_defined(v))
@@ -1041,7 +1050,7 @@ static const char* init_plugin(AVS_ScriptEnvironment* __restrict env)
 {
     static constexpr int REQUIRED_INTERFACE_VERSION{9};
     static constexpr int REQUIRED_BUGFIX_VERSION{2};
-    static constexpr std::initializer_list<std::string_view> required_functions{
+    static constexpr std::string_view required_functions[]{
         "avs_pool_free",           // avs loader helper functions
         "avs_release_clip",        // avs loader helper functions
         "avs_release_value",       // avs loader helper functions
@@ -1067,6 +1076,7 @@ static const char* init_plugin(AVS_ScriptEnvironment* __restrict env)
         "avs_bits_per_component",
         "avs_component_size",
         "avs_num_components",
+        "avs_get_plane_height_subsampling",
     };
 
     if (!avisynth_c_api_loader::get_api(env, REQUIRED_INTERFACE_VERSION, REQUIRED_BUGFIX_VERSION, required_functions))

@@ -1,3 +1,11 @@
+##### Local 1.1.2 audit fixes:
+    Added load, frame-preservation, threading and OpenCL numerical regressions.
+    Fixed negative plane indices, explicit luma-plane selection and tiny-plane padding.
+    Fixed invalid field-property fallback, parameter bounds and scratch-buffer sizing.
+    Fixed SIMD feature gating, signed offsets and backtracking store ordering.
+    Fixed width-doubling chroma geometry using per-plane transpose frames.
+    Fixed floating-point chroma vCheck blend weights.
+
 ##### 1.1.2:
     Fixed race condition leading to crash.
     Fixed memory allocation more than needed.

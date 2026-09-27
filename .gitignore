@@ -360,3 +360,9 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Local CMake builds and generated regression media
+/build/
+/build-*/
+/tests/work/
+build.sh

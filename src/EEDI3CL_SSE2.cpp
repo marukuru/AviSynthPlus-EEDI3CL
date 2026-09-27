@@ -8,7 +8,7 @@ using V_ibool =
 
 template<typename T>
 void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n, bool use_dh,
-    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi)
+    EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override)
 {
     constexpr int planes_y[4]{AVS_PLANAR_Y, AVS_PLANAR_U, AVS_PLANAR_V, AVS_PLANAR_A};
     constexpr int planes_r[4]{AVS_PLANAR_R, AVS_PLANAR_G, AVS_PLANAR_B, AVS_PLANAR_A};
@@ -17,9 +17,9 @@ void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_Vid
 
     for (int plane{0}; plane < g_avs_api->avs_num_components(&fi->vi); ++plane)
     {
-        if (d->process[plane])
+        if (d->process[plane] && (plane_override < 0 || plane == plane_override))
         {
-            const int current_plane{planes[plane]};
+            const int current_plane{plane_override < 0 ? planes[plane] : AVS_DEFAULT_PLANE};
 
             AVS_VideoInfo vi_pad{};
             memcpy(&vi_pad, &fi->vi, sizeof(AVS_VideoInfo));
@@ -30,6 +30,7 @@ void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_Vid
             vi_pad.height = src_h_for_pad + 8;
             avs_helpers::avs_video_frame_ptr pad(g_avs_api->avs_new_video_frame_a(fi->env, &vi_pad, AVS_FRAME_ALIGN));
             AVS_VideoFrame* pad_raw{pad.get()};
+            if (!pad_raw) throw std::runtime_error("padding frame allocation failed");
 
             int peak{d->peak};
 
@@ -62,7 +63,7 @@ void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_Vid
 
             const size_t globalWorkSize[]{static_cast<size_t>((dstWidth + 15) & -16), static_cast<size_t>(d->vectorSize)};
             constexpr size_t localWorkSize[]{16, 4};
-            const int bufferSize{static_cast<int>(dstWidth * d->tpitchVector * sizeof(cl_float))};
+            const size_t bufferSize{static_cast<size_t>(dstWidth) * d->tpitchVector * sizeof(cl_float)};
 
             queue.enqueue_write_image(srcImage, boost::compute::dim(0, 0), boost::compute::dim(paddedWidth, paddedHeight),
                 g_avs_api->avs_get_read_ptr_p(pad_raw, AVS_DEFAULT_PLANE), g_avs_api->avs_get_pitch_p(pad_raw, AVS_DEFAULT_PLANE));
@@ -91,15 +92,15 @@ void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_Vid
 
                         for (int v{std::max(-umax2, u - 1)}; v <= std::min(umax2, u + 1); ++v)
                         {
-                            const auto z{V_float().load_a(ppT + static_cast<size_t>(v) * d->vectorSize) + d->gamma * std::abs(u - v)};
+                            const auto z{V_float().load_a(ppT + static_cast<ptrdiff_t>(v) * d->vectorSize) + d->gamma * std::abs(u - v)};
                             const auto ccost{min(z, FLT_MAX * 0.9f)};
                             idx = select(V_ibool(ccost < bval), v, idx);
                             bval = min(ccost, bval);
                         }
 
-                        const auto z{bval + V_float().load(tT + static_cast<size_t>(u) * d->vectorSize)};
-                        min(z, FLT_MAX * 0.9f).store_a(pT + static_cast<size_t>(u) * d->vectorSize);
-                        idx.store_nt(piT + static_cast<size_t>(u) * d->vectorSize);
+                        const auto z{bval + V_float().load(tT + static_cast<ptrdiff_t>(u) * d->vectorSize)};
+                        min(z, FLT_MAX * 0.9f).store_a(pT + static_cast<ptrdiff_t>(u) * d->vectorSize);
+                        idx.store_a(piT + static_cast<ptrdiff_t>(u) * d->vectorSize);
                     }
                 }
 
@@ -113,7 +114,7 @@ void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_Vid
                     fpath_line[dstWidth - 1] = 0;
                     for (int x{dstWidth - 2}; x >= 0; --x)
                     {
-                        fpath_line[x] = pbackt_line[(static_cast<size_t>(d->tpitch) * x + fpath_line[x + 1]) * d->vectorSize];
+                        fpath_line[x] = pbackt_line[(static_cast<ptrdiff_t>(d->tpitch) * x + fpath_line[x + 1]) * d->vectorSize];
                     }
 
                     const int line_idx{(realY - 4 - field_n) / 2};
@@ -169,8 +170,8 @@ void filterCL_sse2(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_Vid
 }
 
 template void filterCL_sse2<uint8_t>(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n,
-    bool use_dh, EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+    bool use_dh, EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);
 template void filterCL_sse2<uint16_t>(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n,
-    bool use_dh, EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+    bool use_dh, EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);
 template void filterCL_sse2<float>(const AVS_VideoFrame* src, const AVS_VideoFrame* scp, AVS_VideoFrame* dst, const int field_n,
-    bool use_dh, EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi);
+    bool use_dh, EEDI3CLData* __restrict d, const AVS_FilterInfo* __restrict fi, int plane_override);
